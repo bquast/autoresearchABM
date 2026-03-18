@@ -1,30 +1,33 @@
 # autoresearchABM
 
-Autonomous hyperparameter search over a Schelling segregation ABM.
+Autonomous hyperparameter search over a spatial SIR epidemic model.
 Mirrors the structure of karpathy/autoresearch but for agent-based modelling.
 
 ## The model
 
-Each experiment runs a **Schelling segregation** simulation: agents on a 2D grid
-move when they are dissatisfied with the fraction of same-type neighbours around them.
-The system converges to a steady state that is more or less segregated depending
-on the parameters.
+Each experiment runs a **spatial SIR simulation**: agents on a 2D grid transition
+between Susceptible, Infected, and Recovered states. Infected agents spread the
+disease to susceptible neighbours with probability `beta`, and recover with
+probability `gamma`. Spatial structure matters — unlike the classic ODE model,
+local clustering, network topology, and seeding all affect outcomes.
 
-**The metric is `val_il` (validation interface length): lower is more segregated.**
+**The metric is `val_pi` (peak infection prevalence): lower is better.**
 
-Interface length counts edges between cells of different agent types, normalised
-by the number of occupied cells. It is evaluated as the mean over the final
-`EVAL_STEPS` steps, averaged across `N_SEEDS` independent seeds. Lower is more
-segregated (more self-organised clustering); higher is more mixed.
+Peak prevalence is the highest fraction of the grid simultaneously infected —
+"flatten the curve" as an optimisation target. It is averaged across `N_SEEDS = 20`
+independent seeds. Lower = flatter epidemic curve = better.
 
-**Your goal: find the parameter configuration that minimises `val_il`.**
+The run also reports `val_ar` (final attack rate: total fraction ever infected).
+See the note in `train.py` for how to switch to that as the primary metric instead.
+
+**Your goal: find the parameter configuration that minimises `val_pi`.**
 
 ## Files
 
-- `prepare.py` — fixed harness: grid, seeds, metric, time budget. **Do not modify.**
-- `train.py` — the only file you edit. Contains `SchellingConfig` parameters.
+- `prepare.py` — fixed harness: grid, states, metric, time budget. **Do not modify.**
+- `train.py` — the only file you edit. Contains `SIRConfig` parameters.
 - `results.tsv` — experiment log (untracked by git, you maintain this).
-- `program.md` — these instructions (read-only for the agent).
+- `program.md` — these instructions.
 
 ## Setup
 
@@ -35,10 +38,8 @@ To start a new run, work with the user to:
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from main.
 3. **Read the in-scope files**: Read `prepare.py` (understand the engine and metric)
    and `train.py` (the baseline config you will iterate on).
-4. **Verify dependencies**: Check that `numpy` is available (`python -c "import numpy"`).
-   If not, tell the human to install it (`pip install numpy`).
-5. **Initialise results.tsv**: Create it with the header row only. The baseline
-   will be recorded after the first run.
+4. **Verify dependencies**: `python -c "import numpy"`. If missing: `pip install numpy`.
+5. **Initialise results.tsv**: Create it with just the header row.
 6. **Confirm and go**.
 
 Once you get confirmation, kick off the experimentation loop immediately.
@@ -46,81 +47,69 @@ Once you get confirmation, kick off the experimentation loop immediately.
 ## Experimentation
 
 Each experiment runs for a **fixed wall-clock budget of 60 seconds** across
-`N_SEEDS = 20` independent random seeds. You launch it as:
+`N_SEEDS = 20` independent random seeds. Launch as:
 
 ```
 python train.py > run.log 2>&1
 ```
 
 **What you CAN do:**
-- Modify `train.py` — this is the only file you edit.
-  Change any of: `TOLERANCE`, `DENSITY`, `N_GROUPS`, `NEIGHBORHOOD`,
-  `MOVE_RULE`, `UPDATE_ORDER`, or any combination thereof.
-- You may also extend `SchellingConfig` by adding new fields to it in `prepare.py`
-  and implementing the corresponding logic in `run_single` — **but only if you
-  also update `prepare.py` to handle them cleanly**. This is the one exception to
-  the read-only rule: you may add new optional parameters with defaults, but you
-  must not change existing behaviour, change the metric, or change the fixed
-  constants (`GRID_SIZE`, `N_SEEDS`, `TIME_BUDGET`, `MAX_STEPS`, `EVAL_STEPS`,
-  `EMPTY_FRAC`).
+- Modify `train.py` freely: change any of `BETA`, `GAMMA`, `INITIAL_INFECTED`,
+  `NEIGHBORHOOD`, `REWIRE_PROB`, `REINFECTION`, `DELTA`, or any combination.
+- You may add new optional fields to `SIRConfig` in `prepare.py` and implement
+  corresponding logic in `run_single` — but only if you do not change existing
+  behaviour, do not change the metric, and do not change the fixed constants
+  (`GRID_SIZE`, `N_SEEDS`, `TIME_BUDGET`, `MAX_STEPS`).
 
 **What you CANNOT do:**
-- Change `GRID_SIZE`, `N_SEEDS`, `TIME_BUDGET`, `MAX_STEPS`, `EVAL_STEPS`, or
-  `EMPTY_FRAC` in `prepare.py`.
-- Change the `interface_length` function or `run_experiment` signature.
+- Change `GRID_SIZE`, `N_SEEDS`, `TIME_BUDGET`, or `MAX_STEPS` in `prepare.py`.
+- Change the `run_experiment` signature or the `val_pi` / `val_ar` computation.
 - Install new packages.
 
 ## Output format
 
-After the script finishes it prints a summary like this:
-
 ```
 ---
-val_il:           0.412300
-val_il_std:       0.008100
+val_pi:           0.312400
+val_pi_std:       0.021300
+val_ar:           0.748200
+val_ar_std:       0.031100
 seeds_run:        20
-elapsed_s:        58.3
-total_seconds:    58.4
+elapsed_s:        42.1
+total_seconds:    42.2
 grid_size:        100
-tolerance:        0.375
-density:          0.90
-n_groups:         2
+beta:             0.3
+gamma:            0.1
+initial_infected: 0.01
 neighborhood:     moore
-move_rule:        random
-update_order:     random
+rewire_prob:      0.0
+reinfection:      False
+delta:            0.01
 ```
 
 Extract the key metric:
 
 ```
-grep "^val_il:" run.log
+grep "^val_pi:" run.log
 ```
 
 ## Logging results
 
 Log every experiment to `results.tsv` (tab-separated — no commas in descriptions).
-Do NOT git-commit `results.tsv` — leave it untracked.
-
-Columns:
+Do NOT git-commit `results.tsv`.
 
 ```
-commit	val_il	seeds_run	status	description
+commit	val_pi	seeds_run	status	description
 ```
-
-1. Short git commit hash (7 chars)
-2. `val_il` achieved (e.g. `0.412300`) — use `0.000000` for crashes
-3. Seeds completed (e.g. `20`) — use `0` for crashes
-4. Status: `keep`, `discard`, or `crash`
-5. Short description of what this experiment tried
 
 Example:
 
 ```
-commit	val_il	seeds_run	status	description
-a1b2c3d	0.412300	20	keep	baseline
-b2c3d4e	0.389100	20	keep	tolerance 0.375→0.5
-c3d4e5f	0.415000	20	discard	neumann neighborhood
-d4e5f6g	0.000000	0	crash	n_groups=-1 (invalid)
+commit	val_pi	seeds_run	status	description
+a1b2c3d	0.312400	20	keep	baseline
+b2c3d4e	0.287100	20	keep	gamma 0.1→0.2 (faster recovery)
+c3d4e5f	0.318000	20	discard	neumann neighborhood
+d4e5f6g	0.000000	0	crash	beta=-0.1 (invalid)
 ```
 
 ## The experiment loop
@@ -131,53 +120,44 @@ LOOP FOREVER:
 2. Edit `train.py` with your experimental idea.
 3. `git add train.py && git commit -m "<short description>"`
 4. Run: `python train.py > run.log 2>&1`
-5. Extract result: `grep "^val_il:\|^seeds_run:" run.log`
-6. If output is empty → run crashed. Check: `tail -n 40 run.log`. Attempt a fix.
-   If still failing after 2–3 attempts, log as `crash`, revert, move on.
-7. Log the result to `results.tsv`.
-8. If `val_il` improved (lower than current best):
-   - Keep the commit. This is now the new baseline.
-9. If `val_il` is equal or worse:
-   - `git reset --hard HEAD~1` to discard.
+5. Extract result: `grep "^val_pi:\|^seeds_run:" run.log`
+6. If output is empty → crashed. Check: `tail -n 40 run.log`. Fix or skip.
+7. Log to `results.tsv`.
+8. If `val_pi` improved (lower): keep the commit. New baseline.
+9. If equal or worse: `git reset --hard HEAD~1`.
 
-**Timeouts**: Each run should complete in ~60 seconds. If it exceeds 120 seconds,
-kill it (`Ctrl-C`) and treat as a failure.
+**Timeouts**: each run should complete in ~60s. Kill and treat as failure if >120s.
 
-**Crashes**: Fix trivial bugs (typos, bad values) and re-run. If the idea is
-fundamentally broken, skip it and move on.
+**Crashes**: fix trivial issues (bad values, typos) and re-run. Skip fundamentally
+broken ideas.
 
-**Simplicity criterion**: All else equal, simpler is better. A 0.001 improvement
-that adds 30 lines of convoluted logic is not worth it. A 0.001 improvement from
-deleting a parameter is worth it. A wash that simplifies the config? Keep it.
+**Simplicity criterion**: a small improvement that adds complex code is not worth it.
+A simplification with equal results is always worth keeping.
 
-**NEVER STOP**: Once the loop begins, do not pause to ask the human whether to
-continue. Do not ask "should I keep going?" or "is this a good stopping point?".
-You are fully autonomous. Run until the human interrupts you.
+**NEVER STOP**: do not pause to ask the human whether to continue. You are fully
+autonomous. Run until manually interrupted.
 
 ## Parameter space reference
 
-| Parameter      | Type   | Range / Options                          | Notes                               |
-|----------------|--------|------------------------------------------|-------------------------------------|
-| `TOLERANCE`    | float  | 0.0 – 1.0                                | Higher → agents harder to satisfy  |
-| `DENSITY`      | float  | 0.1 – 0.90                               | Fraction of grid occupied           |
-| `N_GROUPS`     | int    | 2 – 6                                    | More groups → less segregation      |
-| `NEIGHBORHOOD` | str    | `moore`, `neumann`, `extended`           | Size of local neighbourhood         |
-| `MOVE_RULE`    | str    | `random`, `nearest`                      | How dissatisfied agents relocate    |
-| `UPDATE_ORDER` | str    | `random`, `shuffled`                     | Order agents are processed          |
+| Parameter         | Type   | Range / Options                        | Notes                                      |
+|-------------------|--------|----------------------------------------|--------------------------------------------|
+| `BETA`            | float  | 0.0 – 1.0                              | Core transmission rate                     |
+| `GAMMA`           | float  | 0.0 – 1.0                              | Recovery rate; R0 ≈ beta/gamma * neighbours|
+| `INITIAL_INFECTED`| float  | 0.001 – 0.1                            | Seed size; affects early dynamics          |
+| `NEIGHBORHOOD`    | str    | `moore`, `neumann`, `extended`         | Larger = faster spread                     |
+| `REWIRE_PROB`     | float  | 0.0 – 1.0                              | Small-world shortcuts; accelerates spread  |
+| `REINFECTION`     | bool   | True / False                           | Switches SIR → SIRS                        |
+| `DELTA`           | float  | 0.0 – 1.0                              | Immunity waning rate (SIRS only)           |
 
-The parameter interactions are genuinely non-linear. For example:
-- High `TOLERANCE` with `nearest` move rule can produce very tight clusters fast.
-- `N_GROUPS > 2` with `extended` neighbourhood tends to resist segregation.
-- `DENSITY` near 0.9 leaves little room to move, slowing convergence.
-
-Think carefully about combinations, not just individual knobs.
-When you find a direction that helps, explore it more deeply before moving on.
+Key relationship: **R0 ≈ beta * n_neighbours / gamma**. The epidemic threshold is
+R0 = 1. Below it, the disease dies out; above it, it spreads. The interesting
+region for minimising peak prevalence is just above R0 = 1.
 
 ## Hypotheses to explore (starter ideas)
 
-- Does `nearest` move rule produce lower `val_il` than `random`?
-- What is the tolerance threshold where segregation transitions sharply?
-- Does `extended` neighborhood help or hurt segregation at high density?
-- Is there an optimal density that maximises segregation for a given tolerance?
-- How does `N_GROUPS = 3` vs `2` affect the equilibrium metric?
-- Does `shuffled` update order converge to a different equilibrium than `random`?
+- What gamma minimises peak prevalence while keeping the epidemic from dying out?
+- Does `neumann` (4 neighbours) produce a flatter curve than `moore` (8)?
+- Does a small `rewire_prob` sharply increase or decrease peak prevalence?
+- Does a smaller `initial_infected` seed meaningfully flatten the curve?
+- At what beta/gamma ratio does the peak transition from near-zero to large?
+- Does SIRS (`reinfection=True`) produce higher or lower peak than SIR at same beta/gamma?

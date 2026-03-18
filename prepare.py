@@ -1,18 +1,15 @@
 """
 autoresearchABM — fixed simulation harness.
-Equivalent of prepare.py in the LLM autoresearch setup.
-
 Contains:
   - Fixed constants (grid size, steps, seeds, time budget)
-  - The Schelling ABM engine
-  - The evaluation metric: mean interface length at equilibrium (lower = more segregated)
+  - The SIR ABM engine
+  - The evaluation metric: mean peak infection prevalence (lower = flatter curve)
   - run_experiment() — the single entry point called by train.py
 
 DO NOT MODIFY THIS FILE.
 The agent modifies train.py only.
 """
 
-import math
 import time
 import numpy as np
 from dataclasses import dataclass
@@ -21,49 +18,59 @@ from dataclasses import dataclass
 # Fixed constants — do not change
 # ---------------------------------------------------------------------------
 
-GRID_SIZE     = 100          # NxN grid
-N_SEEDS       = 20           # random seeds for evaluation averaging
-TIME_BUDGET   = 60           # wall-clock seconds per experiment (1 minute)
-MAX_STEPS     = 5_000        # max simulation steps per seed
-EVAL_STEPS    = 500          # steps over which to average the metric at end
-EMPTY_FRAC    = 0.10         # fraction of cells left empty (fixed)
+GRID_SIZE   = 100        # NxN grid
+N_SEEDS     = 20         # random seeds for evaluation averaging
+TIME_BUDGET = 60         # wall-clock seconds per experiment (1 minute)
+MAX_STEPS   = 1_000      # max simulation steps per seed
 
 # ---------------------------------------------------------------------------
-# Schelling ABM engine
+# SIR ABM engine
 # ---------------------------------------------------------------------------
+
+# Agent states
+S = 0  # Susceptible
+I = 1  # Infected
+R = 2  # Recovered
 
 @dataclass
-class SchellingConfig:
+class SIRConfig:
     """
     Parameters the agent is free to tune in train.py.
 
     Fields
     ------
-    tolerance : float
-        Fraction of same-type neighbours an agent requires to be satisfied.
-        Range [0, 1]. Classic value: 0.3–0.5.
-    density : float
-        Fraction of non-empty cells occupied (rest are empty, capped by EMPTY_FRAC).
-        Range (0, 1 - EMPTY_FRAC].
-    n_groups : int
-        Number of distinct agent types. Must be >= 2.
+    beta : float
+        Probability of transmission per infected neighbour per step.
+        Range (0, 1]. Higher = faster spread.
+    gamma : float
+        Probability an infected agent recovers each step.
+        Range (0, 1]. Higher = shorter infectious period.
+    initial_infected : float
+        Fraction of agents seeded as infected at t=0.
+        Range (0, 1].
     neighborhood : str
-        'moore'   — 8 neighbours (default)
-        'neumann' — 4 neighbours
-        'extended'— 24 neighbours (5x5 minus centre)
-    move_rule : str
-        'random'  — dissatisfied agents jump to a random empty cell
-        'nearest' — dissatisfied agents move to the nearest satisfying empty cell
-    update_order : str
-        'random'  — agents chosen uniformly at random each step
-        'shuffled'— full random permutation each step
+        'moore'    — 8 neighbours
+        'neumann'  — 4 neighbours
+        'extended' — 24 neighbours (5x5 minus centre)
+    reinfection : bool
+        If False: classic SIR (R agents are permanently immune).
+        If True:  SIRS model (R agents return to S after recovery,
+                  with probability delta per step).
+    delta : float
+        Rate at which recovered agents lose immunity (only used if
+        reinfection=True). Range (0, 1].
+    rewire_prob : float
+        Probability of rewiring each neighbour link to a random cell,
+        creating a small-world network effect. 0.0 = pure grid.
+        Range [0, 1].
     """
-    tolerance     : float = 0.375
-    density       : float = 0.90
-    n_groups      : int   = 2
-    neighborhood  : str   = "moore"
-    move_rule     : str   = "random"
-    update_order  : str   = "random"
+    beta             : float = 0.3
+    gamma            : float = 0.1
+    initial_infected : float = 0.01
+    neighborhood     : str   = "moore"
+    reinfection      : bool  = False
+    delta            : float = 0.01
+    rewire_prob      : float = 0.0
 
 
 def _neighbour_offsets(neighborhood: str) -> np.ndarray:
@@ -78,141 +85,130 @@ def _neighbour_offsets(neighborhood: str) -> np.ndarray:
     return np.array(offs, dtype=np.int32)
 
 
-def interface_length(grid: np.ndarray) -> float:
+def _build_neighbour_map(N, offsets, rewire_prob, rng):
     """
-    Count edges between cells of different non-zero types (Moore neighbourhood).
-    Normalised by total number of occupied cells so it's grid-size-independent.
-    Higher = more mixed; lower = more segregated.
-    This is the metric we report. Agents try to find configurations that
-    minimise or maximise it depending on the experiment goal.
+    Pre-compute neighbour indices for every cell.
+    If rewire_prob > 0, each link is independently rewired to a random cell
+    (small-world effect). Returns array of shape (N*N, n_neighbours).
     """
-    occupied = (grid > 0)
-    n_occupied = occupied.sum()
-    if n_occupied == 0:
-        return 0.0
-    count = 0
-    for dr, dc in [(-1, 0), (0, -1)]:  # only count each edge once
-        rolled = np.roll(np.roll(grid, dr, axis=0), dc, axis=1)
-        both_occupied = occupied & (np.roll(np.roll(occupied, dr, axis=0), dc, axis=1))
-        count += (both_occupied & (grid != rolled)).sum()
-    return count / n_occupied
+    n_cells = N * N
+    n_neighbours = len(offsets)
+    neighbours = np.empty((n_cells, n_neighbours), dtype=np.int32)
+
+    for cell in range(n_cells):
+        r, c = divmod(cell, N)
+        for j, (dr, dc) in enumerate(offsets):
+            nr = (r + dr) % N
+            nc = (c + dc) % N
+            neighbours[cell, j] = nr * N + nc
+
+    if rewire_prob > 0.0:
+        mask = rng.random(neighbours.shape) < rewire_prob
+        random_targets = rng.integers(0, n_cells, size=neighbours.shape)
+        neighbours = np.where(mask, random_targets, neighbours)
+
+    return neighbours
 
 
-def run_single(cfg: SchellingConfig, rng: np.random.Generator) -> float:
+def run_single(cfg: SIRConfig, rng: np.random.Generator) -> dict:
     """
-    Run one Schelling simulation to equilibrium (or MAX_STEPS).
-    Returns mean interface_length over the last EVAL_STEPS steps.
+    Run one SIR simulation.
+    Returns dict with peak_prevalence and final_attack_rate.
     """
     N = GRID_SIZE
-    offsets = _neighbour_offsets(cfg.neighborhood)
-
-    # Initialise grid: 0 = empty, 1..n_groups = agent types
     n_cells = N * N
-    n_occupied = int(cfg.density * n_cells * (1 - EMPTY_FRAC) + 0.5)
-    n_occupied = min(n_occupied, int((1 - EMPTY_FRAC) * n_cells))
-    n_per_group = n_occupied // cfg.n_groups
+    offsets = _neighbour_offsets(cfg.neighborhood)
+    neighbours = _build_neighbour_map(N, offsets, cfg.rewire_prob, rng)
 
-    labels = np.zeros(n_cells, dtype=np.int8)
-    for g in range(cfg.n_groups):
-        labels[g * n_per_group:(g + 1) * n_per_group] = g + 1
-    rng.shuffle(labels)
-    grid = labels.reshape(N, N)
+    # Initialise: all susceptible, then seed infections
+    grid = np.full(n_cells, S, dtype=np.int8)
+    n_initial = max(1, int(cfg.initial_infected * n_cells))
+    seed_cells = rng.choice(n_cells, size=n_initial, replace=False)
+    grid[seed_cells] = I
 
-    metric_window = []
+    ever_infected = np.zeros(n_cells, dtype=bool)
+    ever_infected[seed_cells] = True
 
-    for step in range(MAX_STEPS):
-        # Identify occupied cells
-        occupied_rc = np.argwhere(grid > 0)
-        empty_rc    = np.argwhere(grid == 0)
-        if len(empty_rc) == 0:
+    peak_prevalence = n_initial / n_cells
+
+    for _ in range(MAX_STEPS):
+        infected_cells = np.where(grid == I)[0]
+        if len(infected_cells) == 0:
             break
 
-        if cfg.update_order == "shuffled":
-            rng.shuffle(occupied_rc)
-        else:  # random: sample with replacement (fast approx)
-            idx = rng.integers(0, len(occupied_rc), size=len(occupied_rc))
-            occupied_rc = occupied_rc[idx]
+        new_grid = grid.copy()
 
-        moved = False
-        for r, c in occupied_rc:
-            agent_type = grid[r, c]
-            if agent_type == 0:
+        # Transmission: for each infected cell, expose neighbours
+        for cell in infected_cells:
+            nbrs = neighbours[cell]
+            susceptible_nbrs = nbrs[grid[nbrs] == S]
+            if len(susceptible_nbrs) == 0:
                 continue
+            transmit = rng.random(len(susceptible_nbrs)) < cfg.beta
+            newly_infected = susceptible_nbrs[transmit]
+            new_grid[newly_infected] = I
+            ever_infected[newly_infected] = True
 
-            # Count same-type neighbours
-            n_rows = (r + offsets[:, 0]) % N
-            n_cols = (c + offsets[:, 1]) % N
-            neighbour_vals = grid[n_rows, n_cols]
-            n_neighbours = len(offsets)
-            n_same = (neighbour_vals == agent_type).sum()
-            satisfied = (n_same / n_neighbours) >= cfg.tolerance
+        # Recovery
+        recover_mask = (grid == I) & (rng.random(n_cells) < cfg.gamma)
+        new_grid[recover_mask] = R
 
-            if not satisfied:
-                if len(empty_rc) == 0:
-                    continue
-                if cfg.move_rule == "nearest":
-                    # Move to nearest empty cell (Euclidean)
-                    dists = np.abs(empty_rc[:, 0] - r) + np.abs(empty_rc[:, 1] - c)
-                    target_idx = np.argmin(dists)
-                else:
-                    target_idx = rng.integers(0, len(empty_rc))
+        # Reinfection (SIRS)
+        if cfg.reinfection:
+            reinfect_mask = (grid == R) & (rng.random(n_cells) < cfg.delta)
+            new_grid[reinfect_mask] = S
 
-                tr, tc = empty_rc[target_idx]
-                grid[tr, tc] = agent_type
-                grid[r, c] = 0
-                empty_rc[target_idx] = [r, c]
-                moved = True
+        grid = new_grid
 
-        # Collect metric in final window
-        if step >= MAX_STEPS - EVAL_STEPS:
-            metric_window.append(interface_length(grid))
+        prevalence = (grid == I).sum() / n_cells
+        if prevalence > peak_prevalence:
+            peak_prevalence = prevalence
 
-        # Early stopping: no moves in this step
-        if not moved and step > 10:
-            remaining = MAX_STEPS - step - 1
-            last = interface_length(grid)
-            metric_window.extend([last] * min(remaining, EVAL_STEPS))
-            break
+    final_attack_rate = ever_infected.sum() / n_cells
 
-    if not metric_window:
-        metric_window = [interface_length(grid)]
-
-    return float(np.mean(metric_window))
+    return {
+        "peak_prevalence":   peak_prevalence,
+        "final_attack_rate": final_attack_rate,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Public evaluation entry point — called by train.py
 # ---------------------------------------------------------------------------
 
-def run_experiment(cfg: SchellingConfig) -> dict:
+def run_experiment(cfg: SIRConfig) -> dict:
     """
     Run the full evaluation: N_SEEDS independent runs, TIME_BUDGET wall-clock cap.
 
     Returns a dict with:
-        val_il       : float  — mean interface length (the primary metric, lower = more segregated)
-        val_il_std   : float  — std across seeds
-        seeds_run    : int    — how many seeds completed before time ran out
-        elapsed_s    : float  — wall-clock seconds used
-        steps_budget : int    — MAX_STEPS (fixed reference)
+        val_pi       : float — mean peak infection prevalence (primary metric, lower = flatter curve)
+        val_pi_std   : float — std of peak prevalence across seeds
+        val_ar       : float — mean final attack rate across seeds
+        val_ar_std   : float — std of final attack rate across seeds
+        seeds_run    : int   — seeds completed before time ran out
+        elapsed_s    : float — wall-clock seconds used
     """
     t0 = time.time()
-    results = []
+    peak_results = []
+    ar_results   = []
 
     for seed in range(N_SEEDS):
-        elapsed = time.time() - t0
-        if elapsed >= TIME_BUDGET:
+        if time.time() - t0 >= TIME_BUDGET:
             break
         rng = np.random.default_rng(seed)
-        il = run_single(cfg, rng)
-        results.append(il)
+        result = run_single(cfg, rng)
+        peak_results.append(result["peak_prevalence"])
+        ar_results.append(result["final_attack_rate"])
 
     elapsed = time.time() - t0
-    vals = np.array(results)
+    peak = np.array(peak_results)
+    ar   = np.array(ar_results)
 
     return {
-        "val_il":       float(vals.mean()) if len(vals) else float("nan"),
-        "val_il_std":   float(vals.std())  if len(vals) else float("nan"),
-        "seeds_run":    len(vals),
-        "elapsed_s":    elapsed,
-        "steps_budget": MAX_STEPS,
+        "val_pi":     float(peak.mean()) if len(peak) else float("nan"),
+        "val_pi_std": float(peak.std())  if len(peak) else float("nan"),
+        "val_ar":     float(ar.mean())   if len(ar)   else float("nan"),
+        "val_ar_std": float(ar.std())    if len(ar)   else float("nan"),
+        "seeds_run":  len(peak_results),
+        "elapsed_s":  elapsed,
     }
