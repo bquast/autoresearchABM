@@ -8,9 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
-worktrees/
-results/
-queue/
 
 # Agent prompt files (generated per-session by launchers)
 CLAUDE.md
@@ -19,5 +16,7 @@ AGENTS.md
 # Experimental code/artifacts
 dev/
 
-# Results file
+# Results and plots (untracked, generated per run)
 results.tsv
+progress.png
+run.log
